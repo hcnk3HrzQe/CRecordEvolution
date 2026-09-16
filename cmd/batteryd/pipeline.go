@@ -515,7 +515,7 @@ func (p *Pipeline) settle() error {
 		Duration: duration,
 		Valid:    false,
 	}
-	sr := SettledSession{Session: row, AccUA: s.accUAs, DesignUA: p.designUA}
+	sr := SettledSession{Session: row, AccUA: s.accUAs, DesignUA: p.designUA * int64(p.cellCount)}
 
 	upd, err := p.est.OnSession(sr)
 	if err != nil {

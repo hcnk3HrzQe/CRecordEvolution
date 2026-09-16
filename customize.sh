@@ -52,6 +52,22 @@ UiPrint "? 确定安装此模块吗？"
 if [ "$(get_choose)" = "0" ]; then
 	UiPrint "- 已选择安装 $modname"
 	UiPrint " "
+	# 电芯数选择：音量+ 双电芯 | 音量- 单电芯 | 超时默认单电芯
+	UiPrint "****************************"
+	UiPrint "? 你的电池是几节电芯串联？"
+	UiPrint "* 音量+ = 双电芯（如 iQOO/一加Ace系列）"
+	UiPrint "* 音量- = 单电芯（默认，大多数手机）"
+	UiPrint "* 超时自动选择单电芯"
+	UiPrint "****************************"
+	cell_sel="$(get_choose)"
+	if [ "$cell_sel" = "0" ]; then
+		UiPrint "- 已选择：双电芯（×2）"
+		cell_count=2
+	else
+		UiPrint "- 已选择：单电芯（×1）"
+		cell_count=1
+	fi
+	UiPrint " "
 	unzip -o "$ZIPFILE" '/*' -d "$MODPATH" >&2
 	# 保留旧学习数据：Magisk/KSU 升级走 staged update，重启时旧模块目录（含
 	# data/battery.db）被整体删除替换；此处把旧 data 复制进新 MODPATH，避免
@@ -61,6 +77,9 @@ if [ "$(get_choose)" = "0" ]; then
 		mkdir -p "$MODPATH/data"
 		cp -a "$oldmod"/data/. "$MODPATH"/data/ 2>/dev/null
 	fi
+	# 保存电芯数配置
+	mkdir -p "$MODPATH/data"
+	echo "$cell_count" > "$MODPATH/data/cell_count"
 	set_perm "$MODPATH/bin/batteryd" 0 0 0755
 else
 	abort "* 已取消安装"

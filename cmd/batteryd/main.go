@@ -107,7 +107,8 @@ type app struct {
 	st       *Store
 	est      Estimator
 	designUA int64
-	cellCount int
+	cellCount     int
+	cellCountFixed bool // true = 用户安装时选择了电芯数，不自动重检
 
 	nodePaths    map[string]string
 	lastPruneDay int64
@@ -151,14 +152,26 @@ func newApp() (*app, error) {
 	if designUA <= 0 {
 		_ = st.InsertEvent("design_missing", "charge_full_design 缺失或无效，实测估算停用")
 	}
-	// 双电芯检测：读 voltage_now，超过 4.5V 判定为串联双电芯（实际电压 ≈ 单电芯 × 2）。
-	// 双电芯设备的 voltage_now 报告的是串联总电压（如 8.4V），所有基于单电芯
-	// 电压的阈值（CCCT 窗口、ICA 搜索域、ML 归一化）需相应缩放。
+	// 双电芯检测：优先读取安装时选择的配置文件，否则自动检测。
+	// 配置文件 data/cell_count 由 customize.sh 音量键选择写入。
 	cellCount := 1
-	if vNode, err := fs.FindNode("voltage_now"); err == nil {
-		if v, verr := fs.ReadInt(vNode); verr == nil && v > 4_500_000 {
-			cellCount = 2
-			_ = st.InsertEvent("dual_cell", fmt.Sprintf("检测到双电芯，voltage_now=%dµV", v))
+	cellCountFixed := false
+	if ccData, rerr := os.ReadFile(filepath.Join(dataDir, "cell_count")); rerr == nil {
+		if n, cerr := strconv.Atoi(strings.TrimSpace(string(ccData))); cerr == nil && (n == 1 || n == 2) {
+			cellCount = n
+			cellCountFixed = true
+			_ = st.InsertEvent("cell_count_cfg", fmt.Sprintf("使用安装配置 cellCount=%d", n))
+		}
+	}
+	if cellCount == 1 {
+		// 自动检测：读 voltage_now，超过 4.5V 判定为串联双电芯（实际电压 ≈ 单电芯 × 2）。
+		// 双电芯设备的 voltage_now 报告的是串联总电压（如 8.4V），所有基于单电芯
+		// 电压的阈值（CCCT 窗口、ICA 搜索域、ML 归一化）需相应缩放。
+		if vNode, err := fs.FindNode("voltage_now"); err == nil {
+			if v, verr := fs.ReadInt(vNode); verr == nil && v > 4_500_000 {
+				cellCount = 2
+				_ = st.InsertEvent("dual_cell", fmt.Sprintf("检测到双电芯，voltage_now=%dµV", v))
+			}
 		}
 	}
 	// 按电芯数缩放所有电压阈值（CCCT 窗口、ICA 搜索域）
@@ -169,22 +182,27 @@ func newApp() (*app, error) {
 		est = NewLearning(st, cellCount)
 	}
 	return &app{
-		moddir:    moddir,
-		propPath:  filepath.Join(moddir, "module.prop"),
-		fs:        fs,
-		st:        st,
-		est:       est,
-		designUA:  designUA,
-		cellCount: cellCount,
+		moddir:         moddir,
+		propPath:       filepath.Join(moddir, "module.prop"),
+		fs:             fs,
+		st:             st,
+		est:            est,
+		designUA:       designUA,
+		cellCount:      cellCount,
+		cellCountFixed: cellCountFixed,
 	}, nil
 }
 
 // redetectCellCount 周期性重检电芯数：启动时可能因电池深度放电导致误判。
 // 检测到变化时重新初始化 CCCT/ICA 电压阈值。同时刷新 fullUA。
+// 用户安装时选择了电芯数（cellCountFixed=true）时跳过自动重检。
 func (a *app) redetectCellCount(p *Pipeline) {
 	// 刷新 charge_full（满充后会更新）
 	if full, err := a.readIntNode("charge_full"); err == nil {
 		p.setFullUA(full)
+	}
+	if a.cellCountFixed {
+		return
 	}
 	v, err := a.readIntNode("voltage_now")
 	if err != nil {
