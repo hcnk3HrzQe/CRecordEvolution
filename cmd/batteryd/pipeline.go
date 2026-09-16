@@ -88,6 +88,10 @@ type sessionState struct {
 	tempSum    float64
 	tempN      int64
 	lastCap    int64
+	// lastCCChg 充电会话中上一拍 charge_counter（µAh）：充电期间用库仑计
+	// 差分替代 current_now 积分，消除 CV 尾段采样率不足导致的偏低问题。
+	// 0 表示本会话尚无基线。
+	lastCCChg int64
 }
 
 type Pipeline struct {
@@ -110,6 +114,10 @@ type Pipeline struct {
 	// 避免每拍全树扫 /sys）
 	disCCOff bool
 
+	// lastFloatCC 非会话期间的 charge_counter 基线（µAh）：满电浮充无
+	// 活跃会话，但仍需累计 charge_counter 差分计入循环当量。
+	lastFloatCC int64
+
 	// peakChargeUV 本次充电插入周期内的电压峰值（µV）：满电后电压回落判据的
 	// 基准。拔出充电器（转入 Discharging）时清零，下次插入重新建立。
 	peakChargeUV int64
@@ -121,10 +129,6 @@ type Pipeline struct {
 	// notChargStreak status 连续非 Charging 的拍数（去抖计数，不持久化：
 	// 进程重启后从 0 重新计数，最多多等 3 拍才结算，无害）
 	notChargStreak int
-
-	// lastChargeTs 上一拍灌电（Charging/尾段）的墙钟秒，供 charged_ua_total
-	// 跨会话计 dt；与 sess.lastTickTs 独立——满电浮充无会话也照计吞吐。
-	lastChargeTs int64
 
 	winI []int64
 	winV []int64
@@ -390,14 +394,22 @@ func (p *Pipeline) tickCharging(outcome *TickOutcome) error {
 	}
 	suppressed := p.chargeSuppressed(capVal, vUV)
 
-	// 吞吐累计先于会话判定：满电插入不开会话，但浮充电量照计（循环当量口径）；
-	// 假充电电流不计入，否则循环数虚增
-	if !suppressed {
-		if err := p.chargeThroughput(iUA); err != nil {
-			return err
+	// 非会话期间的浮充（cap≥100%）电量也计入循环当量。
+	if !suppressed && !p.sess.active && capVal >= sealCapacity {
+		cc, cerr := p.readNode("charge_counter")
+		if cerr == nil && cc > 0 {
+			if p.lastFloatCC > 0 {
+				delta := cc - p.lastFloatCC
+				if delta > 0 && delta < 500_000 {
+					p.incChargedTotal(delta * p.capacityScale)
+				}
+			}
+			p.lastFloatCC = cc
+		} else {
+			// charge_counter 不可用时用 current_now × 时间
+			p.incChargedTotal(iUA * tickSeconds)
 		}
 	}
-
 	var tempC float64
 	haveTemp := false
 	if tRaw, terr := p.readNode("temp"); terr == nil {
@@ -453,11 +465,6 @@ func (p *Pipeline) tickTailCharge(iUA int64) error {
 	// 尾段同样受峰值回落门控：满电后系统高负载下，本路径也会读到充电器
 	// 直供系统的假电流（实测该场景持续 30+ 分钟、虚增可达 1.1Ah）
 	suppressed := p.chargeSuppressed(capVal, vUV)
-	if !suppressed {
-		if err := p.chargeThroughput(iUA); err != nil {
-			return err
-		}
-	}
 	if vUV > 0 && capVal > 0 {
 		if err := p.st.InsertSample(p.now().Unix(), iUA, vUV, capVal); err != nil {
 			_ = p.st.InsertEvent("sample_fail", err.Error())
@@ -474,26 +481,44 @@ func (p *Pipeline) tickTailCharge(iUA int64) error {
 
 // accumulate 向活跃会话与全局累计充电量（Charging 拍与 CV 尾段拍共用）；
 // 调用方保证会话已开启。
+// 改用 charge_counter 差分（硬件库仑计）替代 current_now × 时间积分：
+// charge_counter 由 BQ28Z610 芯片级计数，不受采样率和 CV 尾段电流
+// 渐变影响，与 AccuBattery/BatteryGuru 取数路径一致。
+// charge_counter 不可用时退化为 current_now × 时间。
 func (p *Pipeline) accumulate(iUA, capVal int64, tempC float64, haveTemp bool, suppressed bool) error {
 	s := &p.sess
-	// 电量按真实时间差累积：daemon 充电期 15s/其余 60s 变步长，固定
-	// tickSeconds 会高估充电期电量 4 倍。dt 上限 90s：覆盖步长切换间隙，
-	// 同时把去抖期回充拍的高估（回充电流按去抖整段时长计）限制在一拍内。
-	dt := tickSeconds
-	now := p.now().Unix()
-	if s.lastTickTs > 0 {
-		if d := now - s.lastTickTs; d >= 1 && d <= 90 {
-			dt = d
-		}
-	}
-	s.lastTickTs = now
-	// suppressed：满电后电压回落的假充电电流不计入电量（时间基线照常推进，
-	// 避免下一拍 dt 跨越被丢弃的区间）
-	if !suppressed {
-		s.accUAs += iUA * dt
-		s.ticks++
-	}
 	s.lastCap = capVal
+	cc, cerr := p.readNode("charge_counter")
+	if cerr != nil || cc <= 0 || s.lastCCChg == 0 {
+		// 首拍或 charge_counter 不可用：退化为 current_now × 时间
+		dt := tickSeconds
+		now := p.now().Unix()
+		if s.lastTickTs > 0 {
+			if d := now - s.lastTickTs; d >= 1 && d <= 90 {
+				dt = d
+			}
+		}
+		s.lastTickTs = now
+		if !suppressed {
+			s.accUAs += iUA * dt
+			s.ticks++
+			p.incChargedTotal(iUA * dt)
+		}
+		if cc > 0 {
+			s.lastCCChg = cc // 建立基线
+		}
+	} else {
+		delta := cc - s.lastCCChg
+		if delta > 0 && delta < 500_000 { // 单拍 < 500mAh 合理
+			scaled := delta * p.capacityScale
+			if !suppressed {
+				s.accUAs += scaled
+				s.ticks++
+				p.incChargedTotal(scaled)
+			}
+		}
+		s.lastCCChg = cc
+	}
 	if haveTemp {
 		ti := int64(tempC)
 		if s.tempN == 0 || ti < s.tempMin {
@@ -512,23 +537,11 @@ func (p *Pipeline) accumulate(iUA, capVal int64, tempC float64, haveTemp bool, s
 	return p.persistSession()
 }
 
-// chargeThroughput 全局充电吞吐累计（循环当量口径）：独立于会话生命周期，
-// 结算后的满电浮充、封账后复插的补电脉冲也计入。dt 用跨会话的 lastChargeTs
-// 差值，clamp 同会话口径。
-func (p *Pipeline) chargeThroughput(iUA int64) error {
-	dt := tickSeconds
-	now := p.now().Unix()
-	if p.lastChargeTs > 0 {
-		if d := now - p.lastChargeTs; d >= 1 && d <= 90 {
-			dt = d
-		}
-	}
-	p.lastChargeTs = now
-	total := kvInt(p.st, kvChargedTotal) + iUA*dt
-	if err := p.st.KVSet(kvChargedTotal, strconv.FormatInt(total, 10)); err != nil {
-		return &SettleError{Err: err}
-	}
-	return nil
+// incChargedTotal 全局充电吞吐累计（循环当量口径）：由 accumulate 调用，
+// 直接加算 charge_counter 差分值，不再自行积分 current_now。
+func (p *Pipeline) incChargedTotal(deltaUA int64) {
+	total := kvInt(p.st, kvChargedTotal) + deltaUA
+	_ = p.st.KVSet(kvChargedTotal, strconv.FormatInt(total, 10))
 }
 
 func (p *Pipeline) persistSession() error {
