@@ -97,6 +97,8 @@ type Pipeline struct {
 	designUA  int64
 	fullUA    int64 // charge_full µAh，用于电流单位交叉校验
 	cellCount int   // 电芯串联数：1=单电芯，2=双电芯（voltage_now > 5V 判定，依据见 main.go）
+	currentScale  int64 // 电流倍率：1 或 2（安装时音量键选择）
+	capacityScale int64 // 容量倍率：1 或 2（安装时音量键选择）
 	now       func() time.Time
 
 	nodePaths map[string]string
@@ -149,15 +151,17 @@ func (p *Pipeline) log(format string, args ...any) {
 	}
 }
 
-func NewPipeline(fs SysFS, st *Store, est Estimator, designUA int64, cellCount int, clock func() time.Time) *Pipeline {
+func NewPipeline(fs SysFS, st *Store, est Estimator, designUA int64, cellCount int, currentScale, capacityScale int64, clock func() time.Time) *Pipeline {
 	p := &Pipeline{
-		fs:        fs,
-		st:        st,
-		est:       est,
-		designUA:  designUA,
-		cellCount: cellCount,
-		now:       clock,
-		nodePaths: map[string]string{},
+		fs:            fs,
+		st:            st,
+		est:           est,
+		designUA:      designUA,
+		cellCount:     cellCount,
+		currentScale:  currentScale,
+		capacityScale: capacityScale,
+		now:           clock,
+		nodePaths:     map[string]string{},
 	}
 	// 读取 charge_full 用于电流单位交叉校验（读不到不影响功能）
 	if path, err := fs.FindNode("charge_full"); err == nil {
@@ -356,7 +360,7 @@ func (p *Pipeline) tailCurrent() (int64, bool) {
 	if err != nil {
 		return 0, false
 	}
-	iUA := NormCurrentUAWithFull(absI64(iRaw), p.fullUA)
+	iUA := NormCurrentUAWithFull(absI64(iRaw), p.fullUA) * p.currentScale
 	if iRaw < 0 {
 		iUA = -iUA
 	}
@@ -376,7 +380,7 @@ func (p *Pipeline) tickCharging(outcome *TickOutcome) error {
 		return &SysfsTransient{Err: err}
 	}
 	iAbs := absI64(iRaw)
-	iUA := absI64(NormCurrentUAWithFull(iAbs, p.fullUA))
+	iUA := absI64(NormCurrentUAWithFull(iAbs, p.fullUA)) * p.currentScale
 
 	// 电压先读：既用于内阻/样本，也用于「满电后假充电电流」门控（见
 	// chargeSuppressed）。峰值的建立与判定都依赖本拍电压。
@@ -580,7 +584,7 @@ func (p *Pipeline) settle() error {
 		EndCap:   s.lastCap,
 		Ua:       s.accUAs,
 		AvgI:     avgI,
-		CRate:    crRate(avgI, p.designUA),
+		CRate:    crRate(avgI, p.designUA*p.capacityScale),
 		TempMin:  s.tempMin,
 		TempMax:  s.tempMax,
 		TempAvg:  tempAvgOf(s.tempSum, s.tempN),
@@ -588,7 +592,7 @@ func (p *Pipeline) settle() error {
 		Duration: duration,
 		Valid:    false,
 	}
-	sr := SettledSession{Session: row, AccUA: s.accUAs, DesignUA: p.designUA}
+	sr := SettledSession{Session: row, AccUA: s.accUAs, DesignUA: p.designUA * p.capacityScale}
 
 	upd, err := p.est.OnSession(sr)
 	if err != nil {
@@ -663,7 +667,7 @@ func (p *Pipeline) recordCCCT(startTs, end int64) []SampleRow {
 		// 旧 ≤C/2 门限把合法快充一票否决）。Fly & Chen 2020 表明高倍率下
 		// ICA 峰显著退化（文献推荐 C/24~C/25），1C 属工程折衷，同源特征
 		// 只按趋势方向采信。
-		if g.MeanUA > p.designUA {
+		if g.MeanUA > p.designUA*p.capacityScale {
 			gateRejected++
 			continue
 		}
@@ -789,7 +793,7 @@ func (p *Pipeline) tickResting(status string) error {
 	if err != nil {
 		return &SysfsTransient{Err: err}
 	}
-	if absI64(NormCurrentUAWithFull(absI64(iRaw), p.fullUA)) >= restQuietUA {
+	if absI64(NormCurrentUAWithFull(absI64(iRaw), p.fullUA))*p.currentScale >= restQuietUA {
 		p.restStreak = 0
 		return nil
 	}

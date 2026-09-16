@@ -53,14 +53,48 @@ if [ "$(get_choose)" = "0" ]; then
 	UiPrint "- 已选择安装 $modname"
 	UiPrint " "
 	unzip -o "$ZIPFILE" '/*' -d "$MODPATH" >&2
-	# 保留旧学习数据：Magisk/KSU 升级走 staged update，重启时旧模块目录（含
-	# data/battery.db）被整体删除替换；此处把旧 data 复制进新 MODPATH，避免
-	# 学习记录随旧目录丢失。MODPATH 目录名即模块 id，不依赖安装器注入变量。
+	# 保留旧学习数据
 	oldmod="/data/adb/modules/`basename "$MODPATH"`"
 	if [ -n "$MODPATH" ] && [ "$oldmod" != "$MODPATH" ] && [ -d "$oldmod/data" ]; then
 		mkdir -p "$MODPATH/data"
 		cp -a "$oldmod"/data/. "$MODPATH"/data/ 2>/dev/null
 	fi
+	mkdir -p "$MODPATH/data"
+
+	# ---- 电流倍率 ----
+	UiPrint "****************************"
+	UiPrint "? 电流 current_now 是否需要 ×2？"
+	UiPrint "* 大多数手机选 音量-（不加倍）"
+	UiPrint "* 双电芯且内核报单电芯电流选 音量+（×2）"
+	UiPrint "* 超时默认不加倍"
+	UiPrint "****************************"
+	cur_sel="$(get_choose)"
+	if [ "$cur_sel" = "0" ]; then
+		UiPrint "- 电流 ×2"
+		echo 2 > "$MODPATH/data/current_scale"
+	else
+		UiPrint "- 电流 ×1（不加倍）"
+		echo 1 > "$MODPATH/data/current_scale"
+	fi
+	UiPrint " "
+
+	# ---- 容量倍率 ----
+	UiPrint "****************************"
+	UiPrint "? 容量 charge_full / charge_full_design 是否需要 ×2？"
+	UiPrint "* 大多数手机选 音量-（不加倍）"
+	UiPrint "* 双电芯且内核报单电芯容量选 音量+（×2）"
+	UiPrint "* 超时默认不加倍"
+	UiPrint "****************************"
+	cap_sel="$(get_choose)"
+	if [ "$cap_sel" = "0" ]; then
+		UiPrint "- 容量 ×2"
+		echo 2 > "$MODPATH/data/capacity_scale"
+	else
+		UiPrint "- 容量 ×1（不加倍）"
+		echo 1 > "$MODPATH/data/capacity_scale"
+	fi
+	UiPrint " "
+
 	set_perm "$MODPATH/bin/batteryd" 0 0 0755
 else
 	abort "* 已取消安装"

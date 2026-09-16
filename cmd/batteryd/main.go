@@ -135,6 +135,9 @@ type app struct {
 	designUA  int64
 	cellCount int
 
+	currentScale  int64 // 电流倍率：1 或 2（安装时音量键选择）
+	capacityScale int64 // 容量倍率：1 或 2（安装时音量键选择）
+
 	nodePaths    map[string]string
 	lastPruneDay int64
 }
@@ -193,19 +196,38 @@ func newApp() (*app, error) {
 	// 按电芯数缩放所有电压阈值（CCCT 窗口、ICA 搜索域）
 	initCCCTVoltage(cellCount)
 	initICAVoltage(cellCount)
+	// 读取安装时音量键选择的倍率配置（current_scale / capacity_scale）。
+	// 文件不存在或值非法时默认 1（不加倍）。
+	currentScale := readIntFile(dataDir, "current_scale", 1)
+	capacityScale := readIntFile(dataDir, "capacity_scale", 1)
 	var est Estimator = NewStable(st)
 	if channel == "ml" {
 		est = NewLearning(st, cellCount)
 	}
 	return &app{
-		moddir:    moddir,
-		propPath:  filepath.Join(moddir, "module.prop"),
-		fs:        fs,
-		st:        st,
-		est:       est,
-		designUA:  designUA,
-		cellCount: cellCount,
+		moddir:        moddir,
+		propPath:      filepath.Join(moddir, "module.prop"),
+		fs:            fs,
+		st:            st,
+		est:           est,
+		designUA:      designUA,
+		cellCount:     cellCount,
+		currentScale:  currentScale,
+		capacityScale: capacityScale,
 	}, nil
+}
+
+// readIntFile 读取 dataDir 下的文本文件，解析为 int64，失败返回 deflt。
+func readIntFile(dataDir, name string, deflt int64) int64 {
+	data, err := os.ReadFile(filepath.Join(dataDir, name))
+	if err != nil {
+		return deflt
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil || (n != 1 && n != 2) {
+		return deflt
+	}
+	return n
 }
 
 // redetectCellCount 周期性重检电芯数：启动时可能因电池深度放电导致误判。
@@ -283,17 +305,14 @@ func cycleEquiv(totalUAs, designUA int64) float64 {
 }
 
 func (a *app) basics() Design {
-	// 内核 charge_full / charge_full_design 按原值展示，不乘电芯数：
-	// charge_full 在双电芯机上已是整包值（真机以 charge_counter/charge_full
-	// ≈ capacity% 验证过），再乘会翻倍；而 healthPct 两侧同乘 cc 属分子分母
-	// 约掉、结果不变（no-op），并不能修 200% 之类口径不一致。双电芯口径差异
-	// 需真机实测后再单独处理，此处保持原值最稳妥。
-	d := Design{DesignMah: a.designUA / 1000, HasDesign: a.designUA > 0}
+	// capacityScale：安装时音量键选择的容量倍率（×1 或 ×2）。
+	// 双电芯设备内核可能报单电芯值，需乘倍率得总包值。
+	d := Design{DesignMah: a.designUA * a.capacityScale / 1000, HasDesign: a.designUA > 0}
 	if full, err := a.readIntNode("charge_full"); err == nil {
-		d.FullMah = full / 1000
+		d.FullMah = full * a.capacityScale / 1000
 		d.HasFull = true
 		if d.HasDesign {
-			d.Pct = healthPct(full, a.designUA)
+			d.Pct = healthPct(full*a.capacityScale, a.designUA*a.capacityScale)
 			d.HasPct = true
 		}
 	}
@@ -460,7 +479,7 @@ func runDaemon() error {
 	// 注入 localNow 而非 time.Now：Pipeline 用 p.now().Format 打决策点日志
 	// （如「[会话] 开始于」），time.Now 在设备上返回 UTC，会与 appendLog 的
 	// 本地时间戳差 8 小时；p.now().Unix() 取值不受影响
-	p := NewPipeline(a.fs, a.st, a.est, a.designUA, a.cellCount, localNow)
+	p := NewPipeline(a.fs, a.st, a.est, a.designUA, a.cellCount, a.currentScale, a.capacityScale, localNow)
 	p.Logf(a.appendLog)
 	lastStatus := ""
 	count := 0
