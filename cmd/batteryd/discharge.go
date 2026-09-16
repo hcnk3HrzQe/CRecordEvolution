@@ -86,7 +86,7 @@ func (p *Pipeline) trackDischarge(status string) {
 		return
 	}
 	if delta := p.dis.lastCC - cc; delta >= 0 && delta <= disResyncUAh {
-		p.dis.accUAh += delta
+		p.dis.accUAh += delta * p.capacityScale
 	} // 反向或超限跳变：电量计回修，重置基线不计数
 	p.dis.lastCC = cc
 	p.persistDis()
